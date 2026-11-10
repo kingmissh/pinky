@@ -5,6 +5,7 @@ package ios
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 	"unsafe"
 
@@ -104,6 +105,11 @@ func (e *h264Encoder) open(bitRate int) error {
 	if r := l.avcodec_open2(ctx, e.codec, &opts); r < 0 {
 		return l.averror("open the "+e.name+" encoder at "+fmt.Sprintf("%dx%d", e.w, e.h), r)
 	}
+	// Say which encoder took the picture, once per stream: a person whose
+	// live picture does not show can see in the log whether Media
+	// Foundation ran or a fallback did, and with what settings.
+	slog.Info("encoding the live picture", "encoder", e.name,
+		"size", fmt.Sprintf("%dx%d", e.w, e.h), "fps", e.fps, "bitrate", bitRate)
 
 	f := l.av_frame_alloc()
 	if f == nil {
