@@ -20,7 +20,10 @@
 //	go run ./cmd/pinky-mirrorbench -wda http://127.0.0.1:18200 -mjpeg http://127.0.0.1:19200
 //
 // It drags in Settings, which it opens first (-app picks another app), and
-// leaves the list where it found it, give or take. The numbers are in
+// leaves the list where it found it, give or take. On an iPhone it drags
+// with WebDriverAgent's swipe, because the helper plays its raw touches
+// back when the finger lifts; -raw-touch measures the raw touches
+// instead, as the mirror sends them. The numbers are in
 // docs/notes/mirror-smoothness.md.
 package main
 
@@ -53,6 +56,7 @@ type config struct {
 	// scrcpy's settings, for trying others (Android only).
 	maxFPS, bitRate, maxSize int
 	codec                    string
+	rawTouch                 bool
 	verbose, json            bool
 }
 
@@ -73,6 +77,7 @@ func main() {
 	flag.IntVar(&c.bitRate, "bitrate", 0, "Android: scrcpy's video bit rate in bits per second (0: the driver's default)")
 	flag.IntVar(&c.maxSize, "max-size", 0, "Android: scrcpy's max_size (0: native)")
 	flag.StringVar(&c.codec, "codec", "", "Android: h264 or h265 (empty: the driver's default)")
+	flag.BoolVar(&c.rawTouch, "raw-touch", false, "iOS: drag with raw touches, as the mirror sends them, instead of WebDriverAgent's swipe")
 	flag.BoolVar(&c.verbose, "v", false, "print every drag")
 	flag.BoolVar(&c.json, "json", false, "print the summary as JSON")
 	flag.Parse()
@@ -113,6 +118,7 @@ type summary struct {
 	StillPaint float64 `json:"still_paint_share"`
 	StillAll   float64 `json:"still_paint_share_with_repeats"`
 	Trials     int     `json:"trials"`
+	TouchRoute string  `json:"touch_route"`
 	LatencyMS  float64 `json:"latency_ms"`
 	ReadyMS    float64 `json:"latency_decoded_ms"`
 	FPS        float64 `json:"moving_fps"`
@@ -148,6 +154,10 @@ func run(ctx context.Context, c config) error {
 	defer dev.Close()
 	sum.OpenMS = ms(time.Since(start))
 	sum.Device = describe(dev.Info())
+	// Which way the drags move the list, so every number below says where
+	// it came from.
+	route := touchRoute(dev, c.rawTouch)
+	sum.TouchRoute = route
 	logf := func(format string, args ...any) {
 		if !c.json {
 			fmt.Printf(format+"\n", args...)
@@ -241,7 +251,7 @@ func run(ctx context.Context, c config) error {
 			logf("drag %d: the screen did not stop changing; dragging anyway", i+1)
 		}
 		up := i%2 == 0 // the finger moves up first, scrolling down the list
-		t, err := drag(ctx, dev, rec, gfx, up, c.drag)
+		t, err := drag(ctx, dev, rec, gfx, up, c.drag, c.rawTouch)
 		if err != nil {
 			return fmt.Errorf("drag %d: %w", i+1, err)
 		}
@@ -257,8 +267,8 @@ func run(ctx context.Context, c config) error {
 			if r.AppFPS > 0 {
 				app = fmt.Sprintf(", app %.1f fps", r.AppFPS)
 			}
-			logf("drag %d: latency %.0f ms (decoded %.0f), %.1f fps moving (%.1f sent), gaps %.1f/%.1f/%.1f ms, %.1f Mbit/s, paint drops 60 Hz %.0f%% 120 Hz %.0f%%%s",
-				i+1, ms(r.Latency), ms(r.Ready), r.FPS, r.Sent, ms(r.GapMedian), ms(r.GapP95), ms(r.GapMax), r.Mbps, r.Drop60*100, r.Drop120*100, app)
+			logf("drag %d: latency %.0f ms (decoded %.0f), %.1f fps moving (%.1f sent), gaps %.1f/%.1f/%.1f ms, %.1f Mbit/s, paint drops 60 Hz %.0f%% 120 Hz %.0f%%%s (%s)",
+				i+1, ms(r.Latency), ms(r.Ready), r.FPS, r.Sent, ms(r.GapMedian), ms(r.GapP95), ms(r.GapMax), r.Mbps, r.Drop60*100, r.Drop120*100, app, route)
 		}
 	}
 	if len(results) == 0 {
@@ -312,7 +322,7 @@ func run(ctx context.Context, c config) error {
 		return e.Encode(sum)
 	}
 	fmt.Printf("\n%d drags, medians:\n", sum.Trials)
-	fmt.Printf("  touch to picture   %.0f ms (decoded %.0f ms)\n", sum.LatencyMS, sum.ReadyMS)
+	fmt.Printf("  touch to picture   %.0f ms, decoded %.0f ms (%s)\n", sum.LatencyMS, sum.ReadyMS, sum.TouchRoute)
 	fmt.Printf("  moving             %.1f changed pictures/s (%.1f sent)\n", sum.FPS, sum.SentFPS)
 	fmt.Printf("  gaps               median %.1f ms, p95 %.1f ms, max %.1f ms\n", sum.GapMS, sum.GapP95MS, sum.GapMaxMS)
 	fmt.Printf("  bit rate           %.1f Mbit/s\n", sum.Mbps)

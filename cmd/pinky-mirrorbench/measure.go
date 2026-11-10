@@ -301,14 +301,39 @@ func firstPicture(ctx context.Context, dev driver.Device) (firstResult, *recorde
 	return f, r, nil
 }
 
+// useSwipe says whether a drag should move the list with WebDriverAgent's
+// swipe rather than with raw touches. A WebDriverAgent device swipes by
+// default: the helper plays its raw touches back when the finger lifts,
+// so timing them would time nothing. With rawTouch the raw touches are
+// measured instead, as the mirror sends them.
+func useSwipe(dev driver.Device, rawTouch bool) bool {
+	if rawTouch {
+		return false
+	}
+	_, ok := dev.(*ios.WDADevice)
+	return ok
+}
+
+// touchRoute names the way the drags move the list, so that every number
+// says which path it came from: the raw touches of the mirror, or
+// WebDriverAgent's swipe.
+func touchRoute(dev driver.Device, rawTouch bool) string {
+	if useSwipe(dev, rawTouch) {
+		return "wda swipe"
+	}
+	return "raw touch"
+}
+
 // drag scrolls the list with raw touches in the stream's pixels, as the
 // person does on the mirror: down at three quarters of the height, a
 // jump past the touch slop, then moves every 8 ms at an even speed to
 // three tenths of it (or the other way), a hold so the list does not fling,
 // and up. A WebDriverAgent device, whose raw touches are replayed at the
-// end, swipes instead.
-func drag(ctx context.Context, dev driver.Device, rec *recorder, gfx *gfxInfo, up bool, dur time.Duration) (trial, error) {
-	if w, ok := dev.(*ios.WDADevice); ok {
+// end, swipes instead, unless rawTouch asks for the raw touches.
+func drag(ctx context.Context, dev driver.Device, rec *recorder, gfx *gfxInfo, up bool, dur time.Duration, rawTouch bool) (trial, error) {
+	if useSwipe(dev, rawTouch) {
+		// useSwipe only says true for a WebDriverAgent device.
+		w, _ := dev.(*ios.WDADevice)
 		return swipe(ctx, w, rec, up, dur)
 	}
 	t, ok := dev.(driver.Toucher)
