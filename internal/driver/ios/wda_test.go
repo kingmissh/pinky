@@ -231,7 +231,7 @@ func TestTouchRecorder(t *testing.T) {
 	r.touch(driver.TouchDown, screen.Point{X: 100, Y: 100}, at(0))
 	r.touch(driver.TouchMove, screen.Point{X: 105, Y: 102}, at(30))
 	g, err := r.touch(driver.TouchUp, screen.Point{X: 106, Y: 103}, at(80))
-	if err != nil || g == nil || !g.tap || g.pts[0] != (screen.Point{X: 100, Y: 100}) || g.held != 80*time.Millisecond {
+	if err != nil || g == nil || !g.tap || g.live || g.pts[0] != (screen.Point{X: 100, Y: 100}) || g.held != 80*time.Millisecond {
 		t.Fatalf("tap: %+v %v", g, err)
 	}
 	// A drag: moves too close or too soon are dropped, the timing kept.
@@ -241,7 +241,7 @@ func TestTouchRecorder(t *testing.T) {
 	r.touch(driver.TouchMove, screen.Point{X: 100, Y: 800}, at(1035)) // too soon
 	r.touch(driver.TouchMove, screen.Point{X: 100, Y: 700}, at(1100)) // kept
 	g, err = r.touch(driver.TouchUp, screen.Point{X: 100, Y: 600}, at(1200))
-	if err != nil || g == nil || g.tap {
+	if err != nil || g == nil || g.tap || !g.live {
 		t.Fatalf("drag: %+v %v", g, err)
 	}
 	wantPts := []screen.Point{{X: 100, Y: 1000}, {X: 100, Y: 900}, {X: 100, Y: 700}, {X: 100, Y: 600}}
