@@ -85,7 +85,7 @@ to test once on a phone.**
   (`PrivateHeaders/XCTest/XCSynthesizedEventRecord.h`), so records can in
   principle mark state that persists past the record; what that state covers
   is not documented, and I found no public use for touch. **Verdict:
-  不清楚 — one small experiment on a phone (two records, the first ending
+  not known — one small experiment on a phone (two records, the first ending
   without `liftUpAtOffset:`) would settle it.**
 - **A continuously driven API.** `XCTRunnerDaemonSession synthesizeEvent:` and
   `FBSynthesizeEventWithRecord` are the same record API WDA already uses
@@ -93,13 +93,13 @@ to test once on a phone.**
   `IOHIDEventSystemClient` and the entitlements `dtuhidd`/backboardd trust;
   the WDA test runner is sandboxed and has none, which is why everything goes
   through testmanagerd. A patched WDA cannot invent a new injection channel;
-  it can only reshape what testmanagerd offers. **Verdict: 做不到 (without
-  those entitlements).**
+  it can only reshape what testmanagerd offers. **Verdict: it cannot be done
+  without those entitlements.**
 - **One undocumented lead:** `XCPointerEventPath` has
   `initForEventStream:frame:speed:` and an `eventStream` property
   (`PrivateHeaders/XCTest/XCPointerEventPath.h`). What an "event stream" is
-  there is undocumented and WDA never uses it. 没查到 any public
-  documentation or use. **Verdict: 不清楚.**
+  there is undocumented and WDA never uses it. I found no public
+  documentation or use. **Verdict: not known.**
 
 What a patched WDA *can* do for sure: take the chunked-stream idea (F1) and
 move it into WDA, closer to the phone — e.g. a route that keeps a gesture
@@ -184,7 +184,7 @@ it below iOS 27 — so it cannot replace WDA here.**
 - **B — patched WDA with a live-touch route.** Work: a small WDA patch and a
   Pinky probe/fallback (seams in §4). Risk: the core premise is unproven —
   XCTest offers no event-by-event injection, and whether a finger can stay
-  down across two records is 不清楚. Ongoing cost: a fork the user must keep
+  down across two records is not known. Ongoing cost: a fork the user must keep
   building and re-signing; upstream merges. Only worth starting after a
   one-hour spike on the phone (a record that never lifts, then a second
   record) answers the §3 question. If the spike fails, B degenerates into
