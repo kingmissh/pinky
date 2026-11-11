@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -111,6 +114,13 @@ func (r *touchRecorder) touch(a driver.TouchAction, p screen.Point, now time.Tim
 			return nil, nil
 		}
 		r.down = false
+		// The lift is recorded even when the clock has not moved since the
+		// last move: the clock is coarse, and two points with the same
+		// time leave the player thinking the phone's finger has not moved,
+		// so it plays the same piece again and again.
+		if n := len(r.at); n > 0 && !now.After(r.at[n-1]) {
+			now = r.at[n-1].Add(time.Nanosecond)
+		}
 		pts, at := append(r.pts, p), append(r.at, now)
 		g := &recordedGesture{held: now.Sub(r.start)}
 		far := r.far
@@ -150,9 +160,25 @@ const (
 	// liveRest is how long the finger may rest before the path recorded
 	// so far is played, so a slow drag is not held back.
 	liveRest = 60 * time.Millisecond
+	// liveHold is how long the finger rests at the end of a segment before
+	// it lifts. A segment that lifts while the finger is moving looks to
+	// the phone like a flick: the content keeps sliding after the finger
+	// is gone, and a drag that is cut into segments flings the content
+	// again and again. A rest first makes the lift happen at a standstill,
+	// so the content stops where the finger stopped.
+	//
+	// Only the last segment of a drag lifts this way: that lift is the
+	// person's own, and it keeps its speed, so the content slides on a
+	// little, as it does on a real phone.
+	liveHold = 50 * time.Millisecond
 	// liveTimeout bounds one segment's request, so a phone that stops
 	// answering does not keep the player waiting.
 	liveTimeout = 10 * time.Second
+	// liveLagWarn is how far past the time a segment asked for the phone may
+	// take before the log calls the drag abnormal. A request has to travel to
+	// the phone and back, which is some tens of milliseconds; much more than
+	// that means the phone is not keeping up with the finger.
+	liveLagWarn = 100 * time.Millisecond
 )
 
 // liveSeg is a piece of the recorded path to play on the phone.
@@ -161,6 +187,7 @@ type liveSeg struct {
 	steps []time.Duration // steps[i]: how long the move to pts[i] took
 	end   time.Time       // when the finger was at the last point of the piece
 	gen   int             // which press the piece belongs to
+	last  bool            // the piece ends the drag: it holds the point the finger lifted at
 }
 
 // liveState is what the player should do next.
@@ -168,8 +195,9 @@ type liveState int
 
 const (
 	liveWait liveState = iota // the piece is not ready: wait for the path
-	liveIdle                  // the drag is over: wait for the next one
+	liveIdle                  // there is no drag to play: wait for the next one
 	livePlay                  // play this piece
+	liveDone                  // the drag is over: everything recorded has been played
 )
 
 // next gives the player the next piece of the path to play on the phone:
@@ -191,7 +219,9 @@ func (r *touchRecorder) next(max, idle time.Duration) (liveSeg, liveState) {
 	from := r.from()
 	if from >= last {
 		if r.up {
-			return liveSeg{}, liveIdle
+			// The finger lifted and everything recorded has been played:
+			// the drag is over.
+			return liveSeg{}, liveDone
 		}
 		return liveSeg{}, liveWait
 	}
@@ -225,7 +255,27 @@ func (r *touchRecorder) next(max, idle time.Duration) (liveSeg, liveState) {
 			steps[i] = max
 		}
 	}
-	return liveSeg{pts: pts, steps: steps, end: r.at[j], gen: r.gen}, livePlay
+	if !r.sentAt.IsZero() && !r.at[j].After(r.sentAt) {
+		// The piece ends where the phone's finger already is: it would be
+		// played again and again. The drag ends here.
+		return liveSeg{}, liveDone
+	}
+	// The last piece is the one that ends at the point the finger lifted
+	// at: that lift is the person's own and keeps its speed. Every other
+	// piece lifts in the middle of the drag, and rests first.
+	return liveSeg{pts: pts, steps: steps, end: r.at[j], gen: r.gen, last: r.up && j == last}, livePlay
+}
+
+// dragTimes returns when the finger went down and when it lifted: the two
+// ends of the drag that is being played. They are zero when no drag has
+// been played.
+func (r *touchRecorder) dragTimes() (time.Time, time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.up || len(r.at) == 0 {
+		return time.Time{}, time.Time{}
+	}
+	return r.start, r.at[len(r.at)-1]
 }
 
 // from is the place in the path the phone's finger has reached: the first
@@ -287,6 +337,73 @@ type liveDrag struct {
 	cancel    context.CancelFunc
 	running   bool  // the player is running
 	err       error // a segment that failed, for the next touch
+	segMax    time.Duration
+	hold      time.Duration
+	tuned     bool // the calibration was read
+}
+
+// The calibration of the live drag may be set from the environment, to
+// measure it on a real phone: PINKY_LIVEDRAG_SEG is the length of a piece
+// in milliseconds, and PINKY_LIVEDRAG_HOLD is the rest before the finger
+// lifts. It is a temporary knob: a value that is not a positive whole
+// number of milliseconds is ignored and the default is used.
+const (
+	liveEnvSeg  = "PINKY_LIVEDRAG_SEG"
+	liveEnvHold = "PINKY_LIVEDRAG_HOLD"
+)
+
+// tune sets how the live drag is cut on this device: how long a piece may
+// take on the phone, and how long the finger rests at the end of a piece
+// before it lifts. A hold of zero means the finger lifts as soon as the
+// piece ends, as it did before the rest was added.
+func (l *liveDrag) tune(seg, hold time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.segMax, l.hold, l.tuned = seg, hold, true
+}
+
+// cutting returns how the live drag is cut: how long a piece may take on
+// the phone, and how long the finger rests before a piece lifts.
+func (l *liveDrag) cutting() (time.Duration, time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.tuned {
+		return liveSegMax, liveHold
+	}
+	return l.segMax, l.hold
+}
+
+// tuneFromEnv reads the calibration from the environment, once, when the
+// player starts.
+func (l *liveDrag) tuneFromEnv() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.tuned {
+		return
+	}
+	l.tuned = true
+	l.segMax, l.hold = liveSegMax, liveHold
+	if ms, ok := liveEnvMS(liveEnvSeg); ok {
+		l.segMax = ms
+	}
+	if ms, ok := liveEnvMS(liveEnvHold); ok {
+		l.hold = ms
+	}
+}
+
+// liveEnvMS reads a length in whole milliseconds from the environment. It
+// gives nothing when the variable is not there, or when it does not name a
+// positive whole number of milliseconds: the default is used then.
+func liveEnvMS(name string) (time.Duration, bool) {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return time.Duration(n) * time.Millisecond, true
 }
 
 // init makes the channels, once.
@@ -341,6 +458,7 @@ func (l *liveDrag) close() {
 // It plays the drags of the mirror until the device closes.
 func (d *WDADevice) startLive() {
 	d.live.init()
+	d.live.tuneFromEnv()
 	d.live.mu.Lock()
 	if d.live.running {
 		d.live.mu.Unlock()
@@ -360,41 +478,167 @@ func (d *WDADevice) startLive() {
 	}()
 }
 
+// liveStats is how a drag was played on the phone, for the log.
+type liveStats struct {
+	gen      int           // which press the drag belongs to
+	segs     int           // pieces that went out
+	pathLen  float64       // how far the phone's finger went, in pixels
+	over     int           // pieces that took longer on the phone than the bound
+	maxPiece time.Duration // the longest piece on the phone
+	maxLag   time.Duration // the longest the phone took beyond a piece's own time
+	lastAt   time.Time     // when the last request ended
+	logged   bool          // the drag has been to the log
+}
+
 // playLive plays the recorded drag on the phone, piece by piece, until the
 // finger lifts and everything recorded has been played.
 func (d *WDADevice) playLive(ctx context.Context) {
+	var st liveStats
 	for {
-		s, st := d.rec.next(liveSegMax, liveRest)
-		switch st {
+		segMax, _ := d.live.cutting()
+		s, state := d.rec.next(segMax, liveRest)
+		switch state {
 		case liveIdle:
-			// The drag is over: wait for the next one.
-			select {
-			case <-d.live.wake:
-			case <-d.live.stop:
-				return
-			case <-ctx.Done():
+			// There is no drag to play: wait for the next one.
+			if !d.waitLive(ctx, 0) {
 				return
 			}
 		case liveWait:
 			// The piece is not ready: wait for more of the path, for the
 			// finger to rest, or for the device to close.
-			select {
-			case <-d.live.wake:
-			case <-d.live.stop:
+			if !d.waitLive(ctx, liveRest) {
 				return
-			case <-ctx.Done():
-				return
-			case <-time.After(liveRest):
 			}
 		case livePlay:
+			if st.gen != s.gen {
+				st = liveStats{gen: s.gen}
+			}
+			started := time.Now()
 			if err := d.sendSeg(ctx, s); err != nil {
 				// The phone may be gone: the drag ends here, and the error
 				// is told on the next touch.
 				d.live.fail(err)
 				d.rec.fail()
+				if !st.logged {
+					st.logged = true
+					d.noteDrag(st, err)
+				}
+				continue
+			}
+			st.segs++
+			st.pathLen += d.sentLen(s.pts)
+			own := liveSegDur(s.steps)
+			if !s.last {
+				// A piece that is not the last waits at its end before it
+				// lifts, and that wait is part of how long the phone spends
+				// on it.
+				_, hold := d.live.cutting()
+				own += hold
+			}
+			if own > st.maxPiece {
+				st.maxPiece = own
+			}
+			lag := time.Since(started) - own
+			if lag > st.maxLag {
+				st.maxLag = lag
+			}
+			if lag > liveLagWarn {
+				// The phone took far longer than the piece asked for: the
+				// drag fell behind the finger here.
+				st.over++
+			}
+			st.lastAt = time.Now()
+		case liveDone:
+			// The drag is over: it goes to the log, once.
+			if !st.logged {
+				st.logged = true
+				d.noteDrag(st, nil)
+			}
+			if !d.waitLive(ctx, 0) {
+				return
 			}
 		}
 	}
+}
+
+// waitLive waits for the next of the path, for the device to close, or for
+// the player to be stopped. It waits for the rest when timeout is not zero.
+// It says whether the player goes on.
+func (d *WDADevice) waitLive(ctx context.Context, timeout time.Duration) bool {
+	if timeout <= 0 {
+		select {
+		case <-d.live.wake:
+		case <-d.live.stop:
+			return false
+		case <-ctx.Done():
+			return false
+		}
+		return true
+	}
+	select {
+	case <-d.live.wake:
+	case <-d.live.stop:
+		return false
+	case <-ctx.Done():
+		return false
+	case <-time.After(timeout):
+	}
+	return true
+}
+
+// sentLen is how far the finger went on the phone for a piece, in screen
+// pixels: the path as it was sent, so a point the phone could not take (the
+// edge of the screen) does not count.
+func (d *WDADevice) sentLen(pts []screen.Point) float64 {
+	var l float64
+	for i := 1; i < len(pts); i++ {
+		a, b := d.toPoints(pts[i-1]), d.toPoints(pts[i])
+		l += math.Hypot(b.X-a.X, b.Y-a.Y) * d.scale
+	}
+	return l
+}
+
+// liveSegDur is how long a piece takes on the phone: the sum of the times
+// its moves are given.
+func liveSegDur(steps []time.Duration) time.Duration {
+	var t time.Duration
+	for _, s := range steps {
+		t += s
+	}
+	return t
+}
+
+// noteDrag logs how a drag was played on the phone: how many pieces went
+// out, how long the drag was, how far it went, how long the phone took to
+// finish the last piece after the finger lifted, and whether any piece took
+// far longer on the phone than it asked for. It is one line for a drag: the
+// person reads pinky.log, and a line for every piece would drown it.
+func (d *WDADevice) noteDrag(st liveStats, err error) {
+	if d.log == nil || (st.segs == 0 && err == nil) {
+		return
+	}
+	down, up := d.rec.dragTimes()
+	var after int64
+	if !st.lastAt.IsZero() && !up.IsZero() {
+		after = st.lastAt.Sub(up).Milliseconds()
+		if after < 0 {
+			after = 0
+		}
+	}
+	args := []any{
+		"device", d.info.ID,
+		"pieces", st.segs,
+		"drag", up.Sub(down).Round(time.Millisecond),
+		"path", int(math.Round(st.pathLen)),
+		"after_lift_ms", after,
+		"piece_max", st.maxPiece.Round(time.Millisecond),
+		"lag_max", st.maxLag.Round(time.Millisecond),
+		"late", st.over,
+	}
+	if err != nil {
+		args = append(args, "error", err)
+	}
+	d.log.Info("iphone: drag played on the phone", args...)
 }
 
 // sendSeg plays one piece of the path on the phone. The request is the
@@ -405,11 +649,19 @@ func (d *WDADevice) sendSeg(ctx context.Context, s liveSeg) error {
 	for i, q := range s.pts {
 		path[i] = d.toPoints(q)
 	}
+	// The finger rests at the end of the piece before it lifts, unless the
+	// piece ends the drag: that lift is the person's own and keeps its
+	// speed, so the content slides on as it does on a real phone.
+	_, hold := d.live.cutting()
+	rest := hold
+	if s.last {
+		rest = 0
+	}
 	d.inputMu.Lock()
 	defer d.inputMu.Unlock()
 	rctx, cancel := context.WithTimeout(ctx, liveTimeout)
 	defer cancel()
-	if err := d.c.gesturePath(rctx, path, s.steps, 0); err != nil {
+	if err := d.c.gesturePathRest(rctx, path, s.steps, 0, rest); err != nil {
 		return err
 	}
 	d.rec.played(s.gen, s.end)

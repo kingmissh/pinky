@@ -450,6 +450,17 @@ func (c *wdaClient) gesture(ctx context.Context, path []wdaPoint, step, hold tim
 // gesturePath is gesture with a duration for each move: steps[i] is how
 // long the move to path[i] takes (steps[0] is ignored).
 func (c *wdaClient) gesturePath(ctx context.Context, path []wdaPoint, steps []time.Duration, hold time.Duration) error {
+	return c.gesturePathRest(ctx, path, steps, hold, 0)
+}
+
+// gesturePathRest is gesturePath with a rest before the finger lifts: when
+// rest is not zero, the finger waits at the last point for that long
+// before it lifts, so the phone sees the finger come to a stop before it
+// goes up. A lift that follows a move looks to the phone like a flick, and
+// the content keeps sliding after the finger is gone; a rest first makes
+// the lift happen at a standstill. The rest is part of the same request:
+// the finger never leaves the screen in between.
+func (c *wdaClient) gesturePathRest(ctx context.Context, path []wdaPoint, steps []time.Duration, hold, rest time.Duration) error {
 	if len(path) == 0 || len(steps) != len(path) {
 		return errors.New("empty gesture")
 	}
@@ -462,6 +473,9 @@ func (c *wdaClient) gesturePath(ctx context.Context, path []wdaPoint, steps []ti
 	}
 	for i, p := range path[1:] {
 		acts = append(acts, map[string]any{"type": "pointerMove", "duration": max(steps[i+1].Milliseconds(), 1), "x": p.X, "y": p.Y})
+	}
+	if rest > 0 {
+		acts = append(acts, map[string]any{"type": "pause", "duration": rest.Milliseconds()})
 	}
 	acts = append(acts, map[string]any{"type": "pointerUp", "button": 0})
 	body := map[string]any{"actions": []any{map[string]any{
