@@ -50,7 +50,6 @@ type WDADevice struct {
 	schemesFn func(context.Context) (map[string][]driver.App, error)
 	rec       touchRecorder
 	rec2      pinchRecorder // the mirror's two-finger touches (pinch.go)
-	live      liveDrag      // the mirror's drag, played while the finger is down (replaytouch.go)
 
 	videoMu sync.Mutex
 	video   driver.Stream // the last stream, whose picture the mirror's touches are in
@@ -1011,7 +1010,6 @@ func (d *WDADevice) videoSize() (int, int) {
 func (d *WDADevice) Close() error {
 	d.closeOnce.Do(func() {
 		d.StopAppLogs()
-		d.live.close() // the player for the mirror's drag ends here
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		d.c.deleteSession(ctx)
 		cancel()
